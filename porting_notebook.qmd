@@ -5,108 +5,289 @@ editor: visual
 ---
 
 ```{r}
-library(DropletUtils)
-library(cytomapper)
+library(Seurat)
 library(SingleCellExperiment)
 library(Matrix)
 
-
+# ----------- Bulletproof 10X Reader (FIXED for duplicates) -----------
 read_10x_mtx <- function(path) {
-  # List all files in the directory
   all_files <- list.files(path)
   
-  # Find the files by pattern
-  mtx_file <- all_files[grepl("matrix.*\\.mtx$", all_files)]
-  barcode_file <- all_files[grepl("barcodes.*\\.tsv$", all_files)]
-  gene_file <- all_files[grepl("genes.*\\.tsv$", all_files)]
+  # Match files (case-insensitive, gz or not)
+  mtx_file     <- all_files[grepl("matrix.*\\.mtx(\\.gz)?$", all_files, ignore.case = TRUE)]
+  barcode_file <- all_files[grepl("barcodes.*\\.tsv(\\.gz)?$", all_files, ignore.case = TRUE)]
+  gene_file    <- all_files[grepl("(genes|features).*\\.tsv(\\.gz)?$", all_files, ignore.case = TRUE)]
   
-  # Check if files exist
-  if(length(mtx_file) == 0) stop("No matrix.mtx file found")
-  if(length(barcode_file) == 0) stop("No barcodes.tsv file found")
-  if(length(gene_file) == 0) stop("No genes.tsv file found")
+  cat("\n📂 Found in:", path, "\n")
+  cat("   🧮 Matrix:  ", paste(mtx_file, collapse = ", "), "\n")
+  cat("   🧬 Barcodes:", paste(barcode_file, collapse = ", "), "\n")
+  cat("   🧪 Genes:   ", paste(gene_file, collapse = ", "), "\n")
   
-  # Read the matrix
+  if (length(mtx_file) == 0) stop("❌ No matrix.mtx file found")
+  if (length(barcode_file) == 0) stop("❌ No barcodes.tsv file found")
+  if (length(gene_file) == 0) stop("❌ No genes.tsv or features.tsv file found")
+  
   mat <- readMM(file.path(path, mtx_file[1]))
   
   # Read barcodes
-  barcodes <- read.table(file.path(path, barcode_file[1]), 
-                        header = FALSE, stringsAsFactors = FALSE)$V1
+  bc_path <- file.path(path, barcode_file[1])
+  barcodes <- if (grepl("\\.gz$", barcode_file[1], ignore.case = TRUE)) {
+    read.table(gzfile(bc_path), header = FALSE, stringsAsFactors = FALSE)$V1
+  } else {
+    read.table(bc_path, header = FALSE, stringsAsFactors = FALSE)$V1
+  }
   
   # Read genes
-  genes <- read.table(file.path(path, gene_file[1]), 
-                     header = FALSE, stringsAsFactors = FALSE)
+  gene_path <- file.path(path, gene_file[1])
+  genes <- if (grepl("\\.gz$", gene_file[1], ignore.case = TRUE)) {
+    read.table(gzfile(gene_path), header = FALSE, stringsAsFactors = FALSE)
+  } else {
+    read.table(gene_path, header = FALSE, stringsAsFactors = FALSE)
+  }
   
-  # Set row and column names
-  rownames(mat) <- genes$V1
+  # CRITICAL FIX: Make gene names unique
+  if (ncol(genes) >= 2) {
+    gene_symbols <- make.unique(genes$V2)  # Force unique symbols
+    gene_ids <- genes$V1
+  } else {
+    gene_symbols <- make.unique(genes$V1)  # Force unique IDs
+    gene_ids <- genes$V1
+  }
+  
+  # Make sure barcodes are also unique
+  barcodes <- make.unique(barcodes)
+  
+  rownames(mat) <- gene_symbols
   colnames(mat) <- barcodes
   
-  # Create SingleCellExperiment object
   sce <- SingleCellExperiment(assays = list(counts = mat))
-  rowData(sce)$symbol <- genes$V2
+  rowData(sce)$symbol <- gene_symbols
+  rowData(sce)$gene_ids <- gene_ids
   
   return(sce)
 }
 
-# Load all samples
-base_path <- "/Users/utkarsh/VIC_Work/Py_scRNA/"
-sample_folders <- c("THb9_counts_filtered", "THb10_counts_filtered", 
-                   "THb11_counts_filtered", "THb12_counts_filtered",
-                   "THb13_counts_filtered", "THb14_counts_filtered",
-                   "THb15_counts_filtered", "THb16_counts_filtered")
-
-sample_paths <- file.path(base_path, sample_folders)
-
-# Load all samples
+# ----------- Load samples with better error handling -----------
+base_path <- "data/scRNA"
+sample_dirs <- list.dirs(base_path, recursive = FALSE)
 sce_list <- list()
-for(i in 1:length(sample_paths)) {
-  sample_name <- gsub("_counts_filtered", "", sample_folders[i])
-  cat("Loading", sample_name, "...\n")
-  sce_list[[sample_name]] <- read_10x_mtx(sample_paths[i])
-  colData(sce_list[[sample_name]])$Sample <- sample_name
+
+for (dir in sample_dirs) {
+  sample_name <- basename(dir)
+  cat("\n🚀 Loading:", sample_name, "\n")
+  tryCatch({
+    sce <- read_10x_mtx(dir)
+    colData(sce)$Sample <- sample_name
+    # Make cell names unique across samples
+    colnames(sce) <- paste0(sample_name, "_", colnames(sce))
+    sce_list[[sample_name]] <- sce
+  }, error = function(e) {
+    cat("⚠️  Skipped", sample_name, "->", e$message, "\n")
+  })
 }
 
-# Check what we loaded
-cat("\nSample summary:\n")
-sample_summary <- data.frame(
-  Sample = names(sce_list),
-  Genes = sapply(sce_list, nrow),
-  Cells = sapply(sce_list, ncol)
-)
-print(sample_summary)
+# Check for any remaining duplicates before combining
+cat("\n🔍 Checking for duplicate gene names...\n")
+all_gene_names <- unlist(lapply(sce_list, rownames))
+cat("Total gene instances:", length(all_gene_names), "\n")
+cat("Unique gene names:", length(unique(all_gene_names)), "\n")
 
-# Combine all samples into one object
+# ----------- Use UNION and handle duplicates properly -----------
+gene_sets <- lapply(sce_list, rownames)
+all_genes <- unique(unlist(gene_sets))  # Use unique() instead of Reduce(union)
+cat("\n🧬 All unique genes:", length(all_genes), "\n")
+
+# Pad missing genes
+for (i in seq_along(sce_list)) {
+  current_genes <- rownames(sce_list[[i]])
+  missing_genes <- setdiff(all_genes, current_genes)
+  
+  if(length(missing_genes) > 0) {
+    zero_counts <- Matrix(0, nrow = length(missing_genes), ncol = ncol(sce_list[[i]]), sparse = TRUE)
+    rownames(zero_counts) <- missing_genes
+    colnames(zero_counts) <- colnames(sce_list[[i]])
+    
+    full_counts <- rbind(counts(sce_list[[i]]), zero_counts)
+    sce_list[[i]] <- SingleCellExperiment(
+      assays = list(counts = full_counts[all_genes, ]),
+      colData = colData(sce_list[[i]])
+    )
+  }
+}
+
+# Combine
 sce_combined <- do.call(cbind, sce_list)
-cat("\nCombined object:\n")
-print(sce_combined)
-cat("\nCells per sample:\n")
-table(sce_combined$Sample)
+cat("\n✅ Combined SCE:", ncol(sce_combined), "cells x", nrow(sce_combined), "genes\n")
+
 ```
 
 ```{r}
-library(scran)
-library(scater)
+library(Seurat)
+library(Matrix)
 
-# Find highly variable genes
-dec <- modelGeneVar(sce_combined)
-hvg <- getTopHVGs(dec, n = 500)
+# Create Seurat object from  sce_combined
+counts_matrix <- counts(sce_combined)
+print(paste("Counts matrix dimensions:", nrow(counts_matrix), "x", ncol(counts_matrix)))
 
-# Look at the top variable genes
-head(dec[order(dec$bio, decreasing = TRUE), ])
+# Check for any issues with names
+print(paste("Any duplicate cell names?", any(duplicated(colnames(counts_matrix)))))
+print(paste("Any duplicate gene names?", any(duplicated(rownames(counts_matrix)))))
+
+# Create Seurat object
+seurat_obj <- CreateSeuratObject(
+  counts = counts_matrix, 
+  meta.data = as.data.frame(colData(sce_combined)),
+  min.cells = 3,    # Filter genes expressed in at least 3 cells
+  min.features = 200 # Filter cells with at least 200 features
+)
+
+print(paste("Seurat object created:", ncol(seurat_obj), "cells x", nrow(seurat_obj), "genes"))
+
+# Normalize
+cat("Normalizing data...\n")
+seurat_obj <- NormalizeData(seurat_obj, verbose = FALSE)
+
+# Find variable features
+cat("Finding variable features...\n")
+seurat_obj <- FindVariableFeatures(seurat_obj, 
+                                   selection.method = "vst", 
+                                   nfeatures = 2000,
+                                   verbose = FALSE)
+
+hvg_seurat <- VariableFeatures(seurat_obj)
+cat("Found", length(hvg_seurat), "highly variable genes\n")
+
+cat("\n Top 20 Highly Variable Genes:\n")
+
+# Method 1: Just show the gene names
+print("Top 20 HVG names:")
+print(head(hvg_seurat, 20))
+
+# Method 2: Try to get the variability info more safely
+tryCatch({
+  hvg_info <- HVFInfo(seurat_obj)
+  if(is.data.frame(hvg_info) && nrow(hvg_info) > 0) {
+    top_20 <- head(hvg_info[order(hvg_info$vst.variance.standardized, decreasing = TRUE), ], 20)
+    print("Top 20 with scores:")
+    print(top_20)
+  } else {
+    cat("HVFInfo didn't return expected format\n")
+  }
+}, error = function(e) {
+  cat("Error getting HVF info:", e$message, "\n")
+  cat("Just showing top 20 gene names instead:\n")
+  print(head(hvg_seurat, 20))
+})
+
+# Look for surface markers (this should work)
+surface_pattern <- "^CD[0-9]|^IL[0-9]|^TNF|^CCR|^CXCR|^HLA|^PDCD|^CTLA|^TIGIT"
+surface_hvg <- hvg_seurat[grepl(surface_pattern, hvg_seurat, ignore.case = TRUE)]
+
+cat("\n Potential CyTOF surface markers in HVG list:", length(surface_hvg), "\n")
+if(length(surface_hvg) > 0) {
+  print(surface_hvg)
+} else {
+  # Look for any surface markers in the full dataset
+  all_genes <- rownames(seurat_obj)
+  all_surface <- all_genes[grepl(surface_pattern, all_genes, ignore.case = TRUE)]
+  cat("Total surface markers in dataset:", length(all_surface), "\n")
+  if(length(all_surface) > 0) {
+    cat("First 10 surface markers found:\n")
+    print(head(all_surface, 10))
+  }
+}
+
+cat("\n📊 Summary:\n")
+cat("- Total genes in Seurat object:", nrow(seurat_obj), "\n")
+cat("- Total cells in Seurat object:", ncol(seurat_obj), "\n") 
+cat("- Highly variable genes found:", length(hvg_seurat), "\n")
+cat("- Surface markers in HVG list:", length(surface_hvg), "\n")
 ```
 
 ```{r}
-#clustering
-sce_combined <- logNormCounts(sce_combined)
-sce_combined <- runPCA(sce_combined)
-sce_combined <- runUMAP(sce_combined)
+# Fix the expression level calculation
+cat("Checking expression levels of surface markers...\n")
 
-# Find clusters
-clusters <- clusterCells(sce_combined, use.dimred="PCA")
-colData(sce_combined)$cluster <- clusters
+# Use the correct way to get normalized data from Seurat
+normalized_data <- GetAssayData(seurat_obj, slot = "data")
 
-# Find marker genes for each cluster
-markers <- findMarkers(sce_combined, groups = sce_combined$cluster)
+# Calculate mean expression for surface markers
+surface_expr <- rowMeans(normalized_data[all_surface, ])
+surface_expr_sorted <- sort(surface_expr, decreasing = TRUE)
 
-# Look at top markers for cluster 1
-head(markers[[1]], 20)
+cat("Top 20 most highly expressed surface markers:\n")
+print(head(surface_expr_sorted, 20))
+
+# Do the same for immune markers
+immune_markers <- c("CD3E", "CD3D", "CD4", "CD8A", "CD8B", "CD19", "CD20", "MS4A1", 
+                   "CD14", "CD16", "FCGR3A", "CD56", "NCAM1", "CD68", "CD11B", "ITGAM",
+                   "CD11C", "ITGAX", "FOXP3", "IL2RA", "CD25", "PTPRC", "CD45")
+
+immune_found <- immune_markers[immune_markers %in% rownames(seurat_obj)]
+cat("\nCommon immune markers found in your data:\n")
+print(immune_found)
+
+if(length(immune_found) > 0) {
+  immune_expr <- rowMeans(normalized_data[immune_found, ])
+  immune_expr_sorted <- sort(immune_expr, decreasing = TRUE)
+  cat("\nExpression levels of immune markers:\n")
+  print(immune_expr_sorted)
+}
+
+
+cat("\nCyTOF Panel Suggestions:\n")
+cat("Based on scRNA data, potential markers:\n\n")
+
+# Top expressed surface markers
+top_surface <- head(names(surface_expr_sorted), 15)
+cat("Top 15 expressed surface markers:\n")
+for(i in 1:length(top_surface)) {
+  cat(sprintf("%2d. %-12s (expression: %.3f)\n", i, top_surface[i], surface_expr_sorted[i]))
+}
+
+# Immune markers if found
+if(length(immune_found) > 0) {
+  cat("\nImmune markers with good expression:\n")
+  good_immune <- immune_expr_sorted[immune_expr_sorted > 0.1]  # Threshold for decent expression
+  for(i in 1:length(good_immune)) {
+    cat(sprintf("    %-12s (expression: %.3f)\n", names(good_immune)[i], good_immune[i]))
+  }
+}
+
+```
+
+```{r}
+# Better approach: Focus on known CyTOF-validated markers
+cytof_validated_markers <- c(
+  # T cells
+  "CD3E", "CD4", "CD8A", "CD8B",
+  # B cells  
+  "CD19", "MS4A1", # MS4A1 = CD20
+  # Monocytes/Macrophages
+  "CD14", "FCGR3A", # FCGR3A = CD16
+  # NK cells
+  "NCAM1", "KLRD1", # NCAM1 = CD56, KLRD1 = CD94
+  # Activation markers
+  "IL2RA", "PDCD1", # IL2RA = CD25, PDCD1 = PD1
+  # HLA
+  "HLA-DRA", "HLA-DRB1"
+)
+
+# Check which are present and well-expressed in your data
+cytof_in_data <- cytof_validated_markers[cytof_validated_markers %in% rownames(seurat_obj)]
+normalized_data <- GetAssayData(seurat_obj, slot = "data")
+cytof_expr <- rowMeans(normalized_data[cytof_in_data, ])
+
+cat("CyTOF-validated markers in your data:\n")
+cytof_ranked <- sort(cytof_expr, decreasing = TRUE)
+print(cytof_ranked)
+
+# Also check cell-type specificity
+cat("\nCell-type specificity analysis:\n")
+for(marker in names(head(cytof_ranked, 10))) {
+  expr_by_sample <- tapply(colMeans(normalized_data[marker, , drop=FALSE]), 
+                          seurat_obj$Sample, mean)
+  cat(sprintf("%-10s: Sample range %.3f - %.3f\n", 
+              marker, min(expr_by_sample), max(expr_by_sample)))
+}
 ```
