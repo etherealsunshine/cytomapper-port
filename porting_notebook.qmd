@@ -1,0 +1,112 @@
+---
+title: "Cytomapper Port"
+format: pdf
+editor: visual
+---
+
+```{r}
+library(DropletUtils)
+library(cytomapper)
+library(SingleCellExperiment)
+library(Matrix)
+
+
+read_10x_mtx <- function(path) {
+  # List all files in the directory
+  all_files <- list.files(path)
+  
+  # Find the files by pattern
+  mtx_file <- all_files[grepl("matrix.*\\.mtx$", all_files)]
+  barcode_file <- all_files[grepl("barcodes.*\\.tsv$", all_files)]
+  gene_file <- all_files[grepl("genes.*\\.tsv$", all_files)]
+  
+  # Check if files exist
+  if(length(mtx_file) == 0) stop("No matrix.mtx file found")
+  if(length(barcode_file) == 0) stop("No barcodes.tsv file found")
+  if(length(gene_file) == 0) stop("No genes.tsv file found")
+  
+  # Read the matrix
+  mat <- readMM(file.path(path, mtx_file[1]))
+  
+  # Read barcodes
+  barcodes <- read.table(file.path(path, barcode_file[1]), 
+                        header = FALSE, stringsAsFactors = FALSE)$V1
+  
+  # Read genes
+  genes <- read.table(file.path(path, gene_file[1]), 
+                     header = FALSE, stringsAsFactors = FALSE)
+  
+  # Set row and column names
+  rownames(mat) <- genes$V1
+  colnames(mat) <- barcodes
+  
+  # Create SingleCellExperiment object
+  sce <- SingleCellExperiment(assays = list(counts = mat))
+  rowData(sce)$symbol <- genes$V2
+  
+  return(sce)
+}
+
+# Load all samples
+base_path <- "/Users/utkarsh/VIC_Work/Py_scRNA/"
+sample_folders <- c("THb9_counts_filtered", "THb10_counts_filtered", 
+                   "THb11_counts_filtered", "THb12_counts_filtered",
+                   "THb13_counts_filtered", "THb14_counts_filtered",
+                   "THb15_counts_filtered", "THb16_counts_filtered")
+
+sample_paths <- file.path(base_path, sample_folders)
+
+# Load all samples
+sce_list <- list()
+for(i in 1:length(sample_paths)) {
+  sample_name <- gsub("_counts_filtered", "", sample_folders[i])
+  cat("Loading", sample_name, "...\n")
+  sce_list[[sample_name]] <- read_10x_mtx(sample_paths[i])
+  colData(sce_list[[sample_name]])$Sample <- sample_name
+}
+
+# Check what we loaded
+cat("\nSample summary:\n")
+sample_summary <- data.frame(
+  Sample = names(sce_list),
+  Genes = sapply(sce_list, nrow),
+  Cells = sapply(sce_list, ncol)
+)
+print(sample_summary)
+
+# Combine all samples into one object
+sce_combined <- do.call(cbind, sce_list)
+cat("\nCombined object:\n")
+print(sce_combined)
+cat("\nCells per sample:\n")
+table(sce_combined$Sample)
+```
+
+```{r}
+library(scran)
+library(scater)
+
+# Find highly variable genes
+dec <- modelGeneVar(sce_combined)
+hvg <- getTopHVGs(dec, n = 500)
+
+# Look at the top variable genes
+head(dec[order(dec$bio, decreasing = TRUE), ])
+```
+
+```{r}
+#clustering
+sce_combined <- logNormCounts(sce_combined)
+sce_combined <- runPCA(sce_combined)
+sce_combined <- runUMAP(sce_combined)
+
+# Find clusters
+clusters <- clusterCells(sce_combined, use.dimred="PCA")
+colData(sce_combined)$cluster <- clusters
+
+# Find marker genes for each cluster
+markers <- findMarkers(sce_combined, groups = sce_combined$cluster)
+
+# Look at top markers for cluster 1
+head(markers[[1]], 20)
+```
